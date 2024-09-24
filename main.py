@@ -116,7 +116,7 @@ def upload_to_cloud_sql(file_name):
         conn.close()
 
 # Skrip utama
-def main():
+def hello_gcs():
     # Cek apakah ada file baru di Cloud Storage
     file_name = check_new_file(BUCKET_NAME)
 

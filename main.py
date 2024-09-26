@@ -95,22 +95,23 @@ def upload_to_cloud_sql(file_name):
 
     try:
         with conn.cursor() as cursor:
-            # Membuka file dari lokal (setelah unzip)
+            # File path ke .bak file
             file_path = os.path.join(TEMP_DIR, file_name)
-            with open(file_path, 'r') as f:
-                data = f.read()
 
-            # Memproses data, misalnya mengirim data ke tabel SQL
-            for line in data.splitlines():
-                # Misal file CSV dengan kolom dipisahkan koma
-                values = line.split(',')
-                cursor.execute(
-                    "INSERT INTO nama_tabel (kolom1, kolom2) VALUES (%s, %s)", (values[0], values[1])
-                )
+            # Query untuk restore database
+            restore_query = f"""
+            RESTORE DATABASE [{database_name}]
+            FROM DISK = N'{file_path}'
+            WITH REPLACE
+            """
 
-            # Commit setelah semua data berhasil dimasukkan
+            # Eksekusi query restore
+            cursor.execute(restore_query)
+
+            # Commit perubahan jika diperlukan
             conn.commit()
-            print(f"File {file_name} berhasil dimasukkan ke Cloud SQL")
+
+            print(f"Database {database_name} berhasil direstore dari file {file_name}")
 
     finally:
         conn.close()

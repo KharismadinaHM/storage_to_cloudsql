@@ -1,0 +1,170 @@
+import os
+import time
+import gzip
+import shutil
+import logging
+from google.cloud import storage
+from google.auth import default
+from google.cloud.sql.connector import Connector
+from googleapiclient.discovery import build
+import pymysql
+import subprocess
+
+# Inisialisasi logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+
+# Inisialisasi client Google Cloud Storage dan SQL Admin API
+storage_client = storage.Client()
+credentials, project = default()
+sqladmin_service = build('sqladmin', 'v1', credentials=credentials)
+
+# Nama bucket dan file
+BUCKET_NAME = 'storage_to_cloud_sql'
+DATABASE_NAME = 'testDB'
+INSTANCE_CONNECTION_NAME = 'dev-kharismadina-hm:asia-southeast2:storage-to-sql-server-2019'
+CLOUD_SQL_INSTANCE = 'storage-to-sql-server-2019'
+CLOUD_SQL_USER = 'sqlserver'
+CLOUD_SQL_PASSWORD = 'sqlserver'
+TEMP_DIR = '/tmp'  # Direktori sementara untuk ekstraksi file
+
+# Fungsi untuk mengecek apakah ada file baru di Cloud Storage
+def check_new_file(bucket_name):
+    bucket = storage_client.get_bucket(bucket_name)
+    blobs = list(bucket.list_blobs())
+
+    # Cek apakah ada file
+    if blobs:
+        return blobs[0].name
+    return None
+
+# Fungsi untuk mendownload dan mengekstrak file GZIP
+def download_and_extract_gzip(bucket_name, file_name, destination_dir):
+    try:
+        # Download file dari Cloud Storage
+        bucket = storage_client.get_bucket(bucket_name)
+        blob = bucket.blob(file_name)
+        gzip_file_path = os.path.join(destination_dir, file_name)
+
+        # Simpan file GZIP ke lokal
+        blob.download_to_filename(gzip_file_path)
+        logging.info(f"File {file_name} berhasil di-download ke {gzip_file_path}")
+
+        # Ekstraksi file GZIP
+        extracted_file_path = gzip_file_path.replace('.gzip', '')  # Nama file setelah diekstrak
+
+        with gzip.open(gzip_file_path, 'rb') as f_in:
+            with open(extracted_file_path, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            logging.info(f"File {file_name} berhasil diekstrak ke {extracted_file_path}")
+
+        return [extracted_file_path]
+    except Exception as e:
+        logging.error(f"Error saat mengekstrak file GZIP: {str(e)}")
+        raise
+
+# Fungsi untuk menghidupkan instance Cloud SQL
+def start_cloud_sql(instance_name):
+    logging.info(f"Menyalakan Cloud SQL instance: {instance_name}")
+    subprocess.run(f"gcloud sql instances patch {instance_name} --activation-policy=ALWAYS", shell=True)
+
+# Fungsi untuk mematikan instance Cloud SQL
+def stop_cloud_sql(instance_name):
+    logging.info(f"Mematikan Cloud SQL instance: {instance_name}")
+    subprocess.run(f"gcloud sql instances patch {instance_name} --activation-policy=NEVER", shell=True)
+
+# Fungsi untuk mengecek apakah Cloud SQL instance sudah siap
+def wait_until_sql_ready(project, instance_name):
+    while True:
+        instance_status = sqladmin_service.instances().get(
+            project=project,
+            instance=instance_name
+        ).execute()
+
+        status = instance_status['state']
+        logging.info(f"Status Cloud SQL instance '{instance_name}': {status}")
+
+        if status == 'RUNNABLE':
+            logging.info(f"Cloud SQL instance '{instance_name}' sudah siap!")
+            break
+
+        # Jika belum siap, tunggu 10 detik dan cek ulang
+        time.sleep(10)
+
+# Fungsi untuk mengirim file dari Cloud Storage ke Cloud SQL
+def upload_to_cloud_sql(file_name):
+    connector = Connector()
+
+    # Koneksi ke database
+    conn = connector.connect(
+        INSTANCE_CONNECTION_NAME,
+        "pymysql",
+        user=CLOUD_SQL_USER,
+        password=CLOUD_SQL_PASSWORD,
+        db=DATABASE_NAME
+    )
+
+    try:
+        with conn.cursor() as cursor:
+            # File path ke .bak file
+            file_path = os.path.join(TEMP_DIR, file_name)
+
+            # Query untuk restore database
+            restore_query = f"""
+            RESTORE DATABASE [{DATABASE_NAME}]
+            FROM DISK = N'{file_path}'
+            WITH REPLACE
+            """
+
+            # Eksekusi query restore
+            cursor.execute(restore_query)
+
+            # Commit perubahan jika diperlukan
+            conn.commit()
+
+            logging.info(f"Database {DATABASE_NAME} berhasil direstore dari file {file_name}")
+    except Exception as e:
+        logging.error(f"Error saat melakukan restore database: {str(e)}")
+        raise
+    finally:
+        conn.close()
+
+# Skrip utama
+def hello_gcs():
+    # Cek apakah ada file baru di Cloud Storage
+    file_name = check_new_file(BUCKET_NAME)
+
+    if file_name:
+        logging.info(f"File baru ditemukan: {file_name}")
+
+        # Jika file adalah file GZIP, ekstrak terlebih dahulu
+        if file_name.endswith('.gzip'):
+            extracted_files = download_and_extract_gzip(BUCKET_NAME, file_name, TEMP_DIR)
+
+            # Step 2: Menyalakan Cloud SQL
+            start_cloud_sql(CLOUD_SQL_INSTANCE)
+
+            # Tunggu hingga Cloud SQL siap
+            wait_until_sql_ready(project, CLOUD_SQL_INSTANCE)
+
+            # Step 3: Upload file yang diekstrak ke Cloud SQL
+            for extracted_file in extracted_files:
+                upload_to_cloud_sql(extracted_file)
+        else:
+            logging.warning("File bukan GZIP, langsung upload ke Cloud SQL")
+
+            # Step 2: Menyalakan Cloud SQL
+            start_cloud_sql(CLOUD_SQL_INSTANCE)
+
+            # Tunggu hingga Cloud SQL siap
+            wait_until_sql_ready(project, CLOUD_SQL_INSTANCE)
+
+            # Step 3: Upload file langsung ke Cloud SQL
+            upload_to_cloud_sql(file_name)
+
+        # Step 4: Mematikan Cloud SQL
+        stop_cloud_sql(CLOUD_SQL_INSTANCE)
+    else:
+        logging.info("Tidak ada file baru di Cloud Storage.")
+
+if __name__ == "__main__":
+    hello_gcs()

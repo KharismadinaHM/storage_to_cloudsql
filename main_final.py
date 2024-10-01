@@ -23,7 +23,7 @@ sqladmin_service = build('sqladmin', 'v1', credentials=credentials)
 
 # Nama bucket dan file
 BUCKET_NAME = 'aggibak'
-DATABASE_NAME = 'testing_function'
+DATABASE_NAME = 'master'
 INSTANCE_CONNECTION_NAME = 'poc-arthagraha:asia-southeast2:seacloud'
 CLOUD_SQL_INSTANCE = 'seacloud'
 CLOUD_SQL_USER = 'sqlserver'
@@ -137,7 +137,7 @@ def connect_with_connector() -> sqlalchemy.engine.base.Engine:
             user=CLOUD_SQL_USER,
             password=CLOUD_SQL_PASSWORD,
             db=DATABASE_NAME,
-            ip_type=IPTypes.PRIVATE
+            ip_type=IPTypes.PUBLIC
         )
         return conn
 
@@ -157,9 +157,9 @@ def upload_to_cloud_sql(file_path):
         with engine.connect() as connection:
             # Query untuk restore database
             restore_query = f"""
-            RESTORE DATABASE [{DATABASE_NAME}]
+            RESTORE DATABASE coba1
             FROM DISK = N'{file_path}'
-            WITH REPLACE
+            WITH RECOVERY
             """
 
             # Eksekusi query restore

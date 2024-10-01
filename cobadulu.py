@@ -19,48 +19,55 @@ credentials, project = default()
 sqladmin_service = build('sqladmin', 'v1', credentials=credentials)
 
 # Nama bucket dan file
-BUCKET_NAME = 'storage_to_cloud_sql'
-DATABASE_NAME = 'testDB'
-INSTANCE_CONNECTION_NAME = 'dev-kharismadina-hm:asia-southeast2:storage-to-sql-server-2019'
-CLOUD_SQL_INSTANCE = 'storage-to-sql-server-2019'
+BUCKET_NAME = 'aggibak'
+DATABASE_NAME = 'testing_function'
+INSTANCE_CONNECTION_NAME = 'poc-arthagraha:asia-southeast2:seacloud'
+CLOUD_SQL_INSTANCE = 'seacloud'
 CLOUD_SQL_USER = 'sqlserver'
-CLOUD_SQL_PASSWORD = 'sqlserver'
-TEMP_DIR = '/tmp'  # Direktori sementara untuk ekstraksi file
+CLOUD_SQL_PASSWORD = '1234'
+TEMP_DIR = '/tmp'  # Direktori sementara untuk unzip file
 
-# Fungsi untuk mengecek apakah ada file baru di Cloud Storage
-def check_new_file(bucket_name):
-    bucket = storage_client.get_bucket(bucket_name)
-    blobs = list(bucket.list_blobs())
+# Fungsi untuk memastikan direktori ada
+def ensure_directory_exists(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+        logging.info(f"Directory {directory} created.")
 
-    # Cek apakah ada file
-    if blobs:
-        return blobs[0].name
-    return None
-
-# Fungsi untuk mendownload dan mengekstrak file GZIP
 def download_and_extract_gzip(bucket_name, file_name, destination_dir):
-    try:
-        # Download file dari Cloud Storage
-        bucket = storage_client.get_bucket(bucket_name)
-        blob = bucket.blob(file_name)
-        gzip_file_path = os.path.join(destination_dir, file_name)
+    # Memastikan direktori sementara ada
+    ensure_directory_exists(destination_dir)
 
+    # Memeriksa apakah file yang diberikan adalah file GZIP
+    logging.info(f"TAHAP 1 : Download and extract gzip")
+    if not file_name.endswith('.gz'):
+        logging.warning(f"File {file_name} bukan file GZIP, tidak dapat diproses.")
+        return []
+
+    # Download file dari Cloud Storage
+    bucket = storage_client.get_bucket(bucket_name)
+    blob = bucket.blob(file_name)
+    gzip_file_path = os.path.join(destination_dir, file_name)
+
+    logging.info(f"Trying to download file from GCS: {file_name} to {gzip_file_path}")
+
+    try:
         # Simpan file GZIP ke lokal
         blob.download_to_filename(gzip_file_path)
         logging.info(f"File {file_name} berhasil di-download ke {gzip_file_path}")
 
         # Ekstraksi file GZIP
-        extracted_file_path = gzip_file_path.replace('.gzip', '')  # Nama file setelah diekstrak
+        extracted_file_path = os.path.join(destination_dir, file_name.replace('.gz', ''))  # Menghilangkan .gz dari nama file
 
         with gzip.open(gzip_file_path, 'rb') as f_in:
             with open(extracted_file_path, 'wb') as f_out:
                 shutil.copyfileobj(f_in, f_out)
-            logging.info(f"File {file_name} berhasil diekstrak ke {extracted_file_path}")
+        logging.info(f"File {file_name} berhasil diekstrak ke {extracted_file_path}")
 
         return [extracted_file_path]
+
     except Exception as e:
-        logging.error(f"Error saat mengekstrak file GZIP: {str(e)}")
-        raise
+        logging.error(f"Error downloading or extracting file: {e}")
+        return []
 
 # Fungsi untuk menghidupkan instance Cloud SQL
 def start_cloud_sql(instance_name):

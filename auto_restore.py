@@ -5,18 +5,13 @@ import logging
 import subprocess
 import time
 import functions_framework 
-import pymssql
 from google.cloud import storage
 from google.auth import default 
 from googleapiclient.discovery import build 
-from google.cloud.sql.connector import Connector 
 from googleapiclient.errors import HttpError
-from google.cloud.sql.connector import Connector
-
-
-# from google.cloud import exceptions
-
-
+from google.cloud.sql.connector import Connector, IPTypes
+import sqlalchemy
+import pytds
 
 # Inisialisasi logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
@@ -80,51 +75,63 @@ def download_and_extract_gzip(bucket_name, file_name, destination_dir):
 # Fungsi untuk menghidupkan instance Cloud SQL
 def start_cloud_sql(instance_name):
     logging.info(f"Menyalakan Cloud SQL instance: {instance_name}")
-    subprocess.run(f"gcloud sql instances patch {instance_name} --activation-policy=ALWAYS", shell=True)
+    subprocess.run(f"gcloud sql instances patch {instance_name} --activation-policy=ALWAYS", shell=True, check=True)
 
 # Fungsi untuk mematikan instance Cloud SQL
 def stop_cloud_sql(instance_name):
     logging.info(f"Mematikan Cloud SQL instance: {instance_name}")
-    subprocess.run(f"gcloud sql instances patch {instance_name} --activation-policy=NEVER", shell=True)
-
+    subprocess.run(f"gcloud sql instances patch {instance_name} --activation-policy=NEVER", shell=True, check=True)
 
 # Fungsi untuk mengecek apakah Cloud SQL instance sudah siap
 def wait_until_sql_ready(project, instance_name):
     while True:
-        instance_status = sqladmin_service.instances().get(
-            project=project,
-            instance=instance_name
-        ).execute()
+        try:
+            instance_status = sqladmin_service.instances().get(
+                project=project,
+                instance=instance_name
+            ).execute()
 
-        status = instance_status['state']
-        logging.info(f"Status Cloud SQL instance '{instance_name}': {status}")
+            status = instance_status.get('state', 'UNKNOWN')
+            logging.info(f"Status Cloud SQL instance '{instance_name}': {status}")
 
-        if status == 'RUNNABLE':
-            logging.info(f"Cloud SQL instance '{instance_name}' sudah siap!")
-            break
+            if status == 'RUNNABLE':
+                logging.info(f"Cloud SQL instance '{instance_name}' sudah siap!")
+                break
 
-        # Jika belum siap, tunggu 10 detik dan cek ulang
-        time.sleep(10)
+            # Jika belum siap, tunggu 10 detik dan cek ulang
+            time.sleep(10)
+        except HttpError as e:
+            logging.error(f"Error checking instance status: {e}")
+            time.sleep(10)
+
+# Fungsi untuk membuat koneksi menggunakan SQLAlchemy dan pytds
+def connect_with_connector() -> sqlalchemy.engine.base.Engine:
+    def getconn() -> pytds.Connection:
+        connector = Connector()
+        conn = connector.connect(
+            INSTANCE_CONNECTION_NAME,  # Cloud SQL connection name
+            "pytds",
+            user=CLOUD_SQL_USER,
+            password=CLOUD_SQL_PASSWORD,
+            db=DATABASE_NAME,
+            ip_type=IPTypes.PRIVATE
+        )
+        return conn
+
+    engine = sqlalchemy.create_engine(
+        "mssql+pytds://",
+        creator=getconn,
+    )
+    logging.info(f"BERHASIL CONNECT SQL SERVER!")
+    return engine
 
 # Fungsi untuk mengirim file dari Cloud Storage ke Cloud SQL
-def upload_to_cloud_sql(file_name):
+def upload_to_cloud_sql(file_path):
     logging.info(f"TAHAP 4 : Upload File ke Cloud SQL")
-    connector = Connector()
-
-    # Koneksi ke database
-    conn = connector.connect(
-        INSTANCE_CONNECTION_NAME,
-        "pyodbc",
-        user=CLOUD_SQL_USER,
-        password=CLOUD_SQL_PASSWORD,
-        db=DATABASE_NAME
-    )
+    engine = connect_with_connector()
 
     try:
-        with conn.cursor() as cursor:
-            # File path ke .bak file
-            file_path = os.path.join(TEMP_DIR, file_name)
-
+        with engine.connect() as connection:
             # Query untuk restore database
             restore_query = f"""
             RESTORE DATABASE [{DATABASE_NAME}]
@@ -133,52 +140,64 @@ def upload_to_cloud_sql(file_name):
             """
 
             # Eksekusi query restore
-            cursor.execute(restore_query)
-
-            # Commit perubahan jika diperlukan
-            conn.commit()
-
-            logging.info(f"Database {DATABASE_NAME} berhasil direstore dari file {file_name}")
+            connection.execute(sqlalchemy.text(restore_query))
+            logging.info(f"Database {DATABASE_NAME} berhasil direstore dari file {file_path}")
     except Exception as e:
         logging.error(f"Error saat melakukan restore database: {str(e)}")
         raise
     finally:
-        conn.close()
+        engine.dispose()
 
 # Fungsi utama untuk menangani event dari Cloud Storage menggunakan CloudEvent
 @functions_framework.cloud_event
 def hello_gcs(cloud_event):
     # Mengambil informasi file dari CloudEvent
     event_data = cloud_event.data
-    file_name = event_data['name']
-    bucket_name = event_data['bucket']
+    file_name = event_data.get('name')
+    bucket_name = event_data.get('bucket')
 
     logging.info(f"Event diterima. File baru ditemukan: {file_name} di bucket: {bucket_name}")
+
+    if not file_name or not bucket_name:
+        logging.error("Event data tidak lengkap. 'name' atau 'bucket' tidak ditemukan.")
+        return
 
     # Jika file adalah file GZIP, ekstrak terlebih dahulu
     if file_name.endswith('.gz'):
         extracted_files = download_and_extract_gzip(bucket_name, file_name, TEMP_DIR)
 
-        # Step 2: Menyalakan Cloud SQL
-        start_cloud_sql(CLOUD_SQL_INSTANCE)
+        if extracted_files:
+            try:
+                # Step 2: Menyalakan Cloud SQL
+                start_cloud_sql(CLOUD_SQL_INSTANCE)
 
-        # Tunggu hingga Cloud SQL siap
-        wait_until_sql_ready(project, CLOUD_SQL_INSTANCE)
+                # Tunggu hingga Cloud SQL siap
+                wait_until_sql_ready(project, CLOUD_SQL_INSTANCE)
 
-        # Step 3: Upload file yang diekstrak ke Cloud SQL
-        for extracted_file in extracted_files:
-            upload_to_cloud_sql(extracted_file)
+                # Step 3: Upload file yang diekstrak ke Cloud SQL
+                for extracted_file in extracted_files:
+                    upload_to_cloud_sql(extracted_file)
+            except Exception as e:
+                logging.error(f"Proses upload gagal: {e}")
+            finally:
+                # Step 4: Mematikan Cloud SQL
+                stop_cloud_sql(CLOUD_SQL_INSTANCE)
     else:
         logging.info(f"File {file_name} bukan GZIP, langsung upload ke Cloud SQL")
 
-        # Step 2: Menyalakan Cloud SQL
-        start_cloud_sql(CLOUD_SQL_INSTANCE)
+        try:
+            # Step 2: Menyalakan Cloud SQL
+            start_cloud_sql(CLOUD_SQL_INSTANCE)
 
-        # Tunggu hingga Cloud SQL siap
-        wait_until_sql_ready(project, CLOUD_SQL_INSTANCE)
+            # Tunggu hingga Cloud SQL siap
+            wait_until_sql_ready(project, CLOUD_SQL_INSTANCE)
 
-        # Step 3: Upload file langsung ke Cloud SQL
-        upload_to_cloud_sql(file_name)
-
-    # Step 4: Mematikan Cloud SQL
-    stop_cloud_sql(CLOUD_SQL_INSTANCE)
+            # Step 3: Upload file langsung ke Cloud SQL
+            file_path = os.path.join(TEMP_DIR, file_name)
+            download_and_extract_gzip(bucket_name, file_name, TEMP_DIR)  # Pastikan file tersedia di TEMP_DIR
+            upload_to_cloud_sql(file_path)
+        except Exception as e:
+            logging.error(f"Proses upload gagal: {e}")
+        finally:
+            # Step 4: Mematikan Cloud SQL
+            stop_cloud_sql(CLOUD_SQL_INSTANCE)

@@ -1,80 +1,74 @@
-import os
-import gzip
-import shutil
-import logging
-import subprocess
-import time
-import functions_framework 
+import os, sys, logging, subprocess, time, functions_framework # type: ignore
+from google.auth.transport.requests import Request
 from google.cloud import storage
 from google.auth import default 
 from googleapiclient.discovery import build 
 from googleapiclient.errors import HttpError
 from google.cloud.sql.connector import Connector, IPTypes
 import sqlalchemy
+import requests
 import pytds
 
-# Inisialisasi logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+# Setting logging
+logging.basicConfig(level=logging.warning, format='%(asctime)s %(levelname)s: %(message)s')
 
-# Inisialisasi client Google Cloud Storage dan SQL Admin API
+# Set class
 storage_client = storage.Client()
 credentials, project = default()
 sqladmin_service = build('sqladmin', 'v1', credentials=credentials)
 
-# Nama bucket dan file
-BUCKET_NAME = 'aggibak'
-DATABASE_NAME = 'master'
-INSTANCE_CONNECTION_NAME = 'poc-arthagraha:asia-southeast2:seacloud'
-CLOUD_SQL_INSTANCE = 'seacloud'
+# Define constant variable
+BUCKET_NAME = 'agi2_automatic_restore_bucket'
+# INSTANCE_CONNECTION_NAME = 'poc-arthagraha:asia-southeast2:seacloud-clone'
+CLOUD_SQL_INSTANCE = 'seacloud-clone'
 CLOUD_SQL_USER = 'sqlserver'
 CLOUD_SQL_PASSWORD = '1234'
 TEMP_DIR = '/tmp'  # Direktori sementara untuk unzip file
 
-# # Fungsi untuk memastikan direktori ada
-# def ensure_directory_exists(directory):
-#     if not os.path.exists(directory):
-#         os.makedirs(directory)
-#         logging.info(f"Directory {directory} created.")
+def check_file_name(file_name, destination_dir):
 
-def download_and_extract_gzip(bucket_name, file_name, destination_dir):
-    # Memastikan direktori sementara ada
-    # ensure_directory_exists(destination_dir)
-
-    # Memeriksa apakah file yang diberikan adalah file GZIP
-    logging.info(f"TAHAP 1 : Download and extract gzip")
-    if not file_name.endswith('.gz'):
-        logging.warning(f"File {file_name} bukan file GZIP, tidak dapat diproses.")
-        return []
-
-    # Download file dari Cloud Storage
-    bucket = storage_client.get_bucket(bucket_name)
-    blob = bucket.blob(file_name)
-    gzip_file_path = os.path.join(destination_dir, file_name)
-
-    logging.info(f"Trying to download file from GCS: {file_name} to {gzip_file_path}")
-
+    # Memeriksa apakah file yang diberikan adalah file GZIP atau BAK
+    logging.warning("TAHAP 1 : Download and extract gzip")
     try:
-        # Simpan file GZIP ke lokal
-        blob.download_to_filename(gzip_file_path)
-        logging.info(f"File {file_name} berhasil di-download ke {gzip_file_path}")
+        if file_name.endswith('.gz'):
+            logging.warning(f"=========== Terdeteksi file {file_name} berformat .gz, segera diproses")
+            file_parts = file_name.split('.')[0].split('_')  # Pisah dengan '_' dan hilangkan ekstensi
+            file_name = os.path.join(destination_dir, file_name.replace('.gz', ''))  # Menghilangkan .gz dari nama file
+            region = file_parts[0].lower()  # 'sea'
+            environment = file_parts[1].lower()  # 'uat' 
+            date = file_parts[2]  # '20240807'
+            
+            # Membentuk nama database dinamis
+            database_name = f"sea_agi_db"
+            return database_name
+        
+        elif file_name.endswith('.bak'):
+            logging.warning(f"=========== Terdeteksi file {file_name} berformat .bak, segera diproses")
+            file_parts = file_name.split('.')[0].split('_')  # Pisah dengan '_' dan hilangkan ekstensi
+            file_name = os.path.join(destination_dir, file_name.replace('.bak', ''))  # Menghilangkan .gz dari nama file
+            region = file_parts[0].lower()  # 'sea'
+            environment = file_parts[1].lower()  # 'uat'
+            date = file_parts[2]  # '20240807'
 
-        # Ekstraksi file GZIP
-        extracted_file_path = os.path.join(destination_dir, file_name.replace('.gz', ''))  # Menghilangkan .gz dari nama file
-
-        with gzip.open(gzip_file_path, 'rb') as f_in:
-            with open(extracted_file_path, 'wb') as f_out:
-                shutil.copyfileobj(f_in, f_out)
-        logging.info(f"File {file_name} berhasil diekstrak ke {extracted_file_path}")
-
-        return [extracted_file_path]
-
+            # Membentuk nama database dinamis
+            database_name = f"sea_agi_db"
+            return database_name
+        else:
+            logging.error(f'=========== Format dari file {file_name} tidak didukung!')
+            sys.exit(1)  # Menghentikan program jika format file tidak didukung
     except Exception as e:
-        logging.error(f"Error downloading or extracting file: {e}")
-        return []
+        logging.error(f'=========== Terjadi kesalahan dalam pengecekan format file: {e}')
+        sys.exit(1)
 
-# Fungsi untuk menghidupkan instance Cloud SQL menggunakan API
-def start_cloud_sql(project, instance_name):
-    logging.info(f"TAHAP 2 : Start Cloud SQL")
+# Fungsi untuk memeriksa status instance Cloud SQL
+def get_instance_status(instance_name, project):
+    request = sqladmin_service.instances().get(project=project, instance=instance_name)
+    response = request.execute()
+    return response['state']
+
+# Fungsi untuk menyalakan Cloud SQL instance jika belum aktif
+def start_cloud_sql(instance_name, project):
+    logging.warning(f"TAHAP 2 : Start Cloud SQL")
     try:
         # Menggunakan API Cloud SQL untuk mengubah kebijakan aktivasi
         request = sqladmin_service.instances().patch(
@@ -83,129 +77,142 @@ def start_cloud_sql(project, instance_name):
             body={"settings": {"activationPolicy": "ALWAYS"}}
         )
         response = request.execute()
-        logging.info(f"Cloud SQL instance '{instance_name}' sedang dinyalakan.")
+        logging.warning(f"Cloud SQL instance '{instance_name}' sedang dinyalakan.")
         return response
     except Exception as e:
         logging.error(f"Error starting Cloud SQL instance: {e}")
         return None
 
+def stop_cloud_sql(instance_name, project):
+    logging.warning(f"=========== Mematikan instance {instance_name}...")
 
-# Fungsi untuk mematikan instance Cloud SQL menggunakan API
-def stop_cloud_sql(project, instance_name):
-    logging.info(f"TAHAP 4 : Matikan Cloud SQL")
-    try:
-        # Menggunakan API Cloud SQL untuk mengubah kebijakan aktivasi
-        request = sqladmin_service.instances().patch(
-            project=project,
-            instance=instance_name,
-            body={"settings": {"activationPolicy": "NEVER"}}
-        )
-        response = request.execute()
-        logging.info(f"Cloud SQL instance '{instance_name}' sedang dimatikan.")
-        return response
-    except Exception as e:
-        logging.error(f"Error stopping Cloud SQL instance: {e}")
-        return None
-
+    # Patch untuk mengubah activation policy menjadi 'NEVER'
+    request = sqladmin_service.instances().patch(
+        project=project,
+        instance=instance_name,
+        body={"settings": {"activationPolicy": "NEVER"}}
+    )
+    
+    response = request.execute()
+    logging.warning(f"Response: {response}")
 
 # Fungsi untuk mengecek apakah Cloud SQL instance sudah siap
 def wait_until_sql_ready(project, instance_name):
-    logging.info(f"TAHAP 3 : Tunggu Cloud SQL Siap")
     while True:
-        instance_status = sqladmin_service.instances().get(
-            project=project,
-            instance=instance_name
-        ).execute()
+        try:
+            instance_status = sqladmin_service.instances().get(
+                project=project,
+                instance=instance_name
+            ).execute()
 
-        status = instance_status['state']
-        logging.info(f"Status Cloud SQL instance '{instance_name}': {status}")
+            status = instance_status.get('state', 'UNKNOWN')
+            logging.warning(f"=========== Status Cloud SQL instance '{instance_name}': {status}")
 
-        if status == 'RUNNABLE':
-            logging.info(f"Cloud SQL instance '{instance_name}' sudah siap!")
-            break
+            if status == 'RUNNABLE':
+                logging.warning(f"=========== Cloud SQL instance '{instance_name}' sudah siap!")
+                break
 
-        # Jika belum siap, tunggu 10 detik dan cek ulang
-        time.sleep(10)
+            # Jika belum siap, tunggu 10 detik dan cek ulang
+            time.sleep(10)
+        except HttpError as e:
+            logging.error(f"=========== Error checking instance status: {e}")
+            time.sleep(10)
 
-# Fungsi untuk membuat koneksi menggunakan SQLAlchemy dan pytds
-def connect_with_connector() -> sqlalchemy.engine.base.Engine:
-    def getconn() -> pytds.Connection:
-        connector = Connector()
-        conn = connector.connect(
-            INSTANCE_CONNECTION_NAME,  # Cloud SQL connection name
-            "pytds",
-            user=CLOUD_SQL_USER,
-            password=CLOUD_SQL_PASSWORD,
-            db=DATABASE_NAME,
-            ip_type=IPTypes.PUBLIC
-        )
-        return conn
+# def check_and_delete_existing_db(file_name, instance_name, project):
+#     logging.warning(f"=========== Memeriksa apakah database {file_name} sudah ada...")
 
-    engine = sqlalchemy.create_engine(
-        "mssql+pytds://",
-        creator=getconn,
-    )
-    logging.info(f"BERHASIL CONNECT SQL SERVER!")
-    return engine
+#     # Mendapatkan daftar database dari Cloud SQL
+#     request = sqladmin_service.databases().list(project=project, instance=instance_name)
+#     response = request.execute()
+
+#     # Memproses response untuk mendapatkan list nama database
+#     database_list = [db['name'] for db in response.get('items', [])]
+
+#     # Mengecek apakah file_name ada dalam daftar database
+#     if file_name in database_list:
+#         logging.warning(f"=========== Database {file_name} ditemukan, akan dihapus untuk restore.")
+#         # Menghapus database jika ditemukan
+#         delete_request = sqladmin_service.databases().delete(project=project, instance=instance_name, database=file_name)
+#         delete_response = delete_request.execute()
+#         logging.warning(f"=========== Database {file_name} berhasil dihapus. Response: {delete_response}")
+#     else:
+#         logging.warning(f"=========== Database {file_name} tidak ditemukan, melanjutkan tanpa menghapus.")
+
+def check_and_delete_existing_db(file_name, instance_name, project):
+    file_name = 'sea_agi_db'
+    logging.warning(f"=========== Memeriksa apakah database {file_name} sudah ada...")
+
+    # Mendapatkan daftar database dari Cloud SQL
+    request = sqladmin_service.databases().list(project=project, instance=instance_name)
+    response = request.execute()
+
+    # Memproses response untuk mendapatkan list nama database
+    database_list = [db['name'] for db in response.get('items', [])]
+
+    # Mengecek apakah file_name ada dalam daftar database
+    if file_name in database_list:
+        logging.warning(f"=========== Database {file_name} ditemukan, akan dihapus untuk restore.")
+        # Menghapus database jika ditemukan
+        delete_request = sqladmin_service.databases().delete(project=project, instance=instance_name, database=file_name)
+        delete_response = delete_request.execute()
+        logging.warning(f"=========== Database {file_name} berhasil dihapus. Response: {delete_response}")
+    else:
+        logging.warning(f"=========== Database {file_name} tidak ditemukan, melanjutkan tanpa menghapus.")
 
 # Fungsi untuk mengirim file dari Cloud Storage ke Cloud SQL
-def upload_to_cloud_sql(file_path):
-    logging.info(f"TAHAP 4 : Upload File ke Cloud SQL")
-    engine = connect_with_connector()
+def restore_backup(bucket_name, file_name, instance_name, project):
+    database_name = check_file_name(file_name, TEMP_DIR)
+    logging.warning(f"=========== TAHAP 4 : Restore file to Cloud SQL")
 
-    try:
-        with engine.connect() as connection:
-            # Query untuk restore database
-            restore_query = f"""
-            RESTORE DATABASE coba1
-            FROM DISK = N'{file_path}'
-            WITH RECOVERY
-            """
+    if file_name.endswith('.bak'):
+        # Menggunakan Cloud SQL Admin API untuk restore .bak file
+        body = {
+            'importContext': {
+                'fileType': 'BAK',
+                'uri': f'gs://{bucket_name}/{file_name}',
+                'database': f'{database_name}'
+            }
+        }
+        request = sqladmin_service.instances().import_(project=project, instance=instance_name, body=body)
+        response = request.execute()
+        logging.warning(f"=========== Restore .bak file sedang diproses. Response: {response}")
 
-            # Eksekusi query restore
-            connection.execute(sqlalchemy.text(restore_query))
-            logging.info(f"Database {DATABASE_NAME} berhasil direstore dari file {file_path}")
-    except Exception as e:
-        logging.error(f"Error saat melakukan restore database: {str(e)}")
-        raise
-    finally:
-        engine.dispose()
+    elif file_name.endswith('.gz'):
+        # Menggunakan Cloud SQL Admin API untuk restore .gz file
+        body = {
+            'importContext': {
+                'fileType': 'SQL',
+                'uri': f'gs://{bucket_name}/{file_name}',
+                'database': f'{database_name}'
+            }
+        }
+        request = sqladmin_service.instances().import_(project=project, instance=instance_name, body=body)
+        response = request.execute()
+        logging.warning(f"=========== Restore .gz file sedang diproses. Response: {response}")
 
 # Fungsi utama untuk menangani event dari Cloud Storage menggunakan CloudEvent
 @functions_framework.cloud_event
 def hello_gcs(cloud_event):
-    # Mengambil informasi file dari CloudEvent
-    event_data = cloud_event.data
-    file_name = event_data.get('name')
-    bucket_name = event_data.get('bucket')
+    try:
+        # Mengambil informasi file dari CloudEvent
+        event_data = cloud_event.data
+        file_name = event_data.get('name')
+        bucket_name = event_data.get('bucket')
 
-    logging.info(f"Event diterima. File baru ditemukan: {file_name} di bucket: {bucket_name}")
+        logging.warning(f"=========== Event diterima. File baru ditemukan: {file_name} di bucket: {bucket_name}")
 
-    # Jika file adalah file GZIP, ekstrak terlebih dahulu
-    if file_name.endswith('.gz'):
+        check_file_name(file_name, TEMP_DIR)
 
-        extracted_files = download_and_extract_gzip(bucket_name, file_name, TEMP_DIR)
+        # start_cloud_sql(CLOUD_SQL_INSTANCE, project)
 
-        # Step 2: Menyalakan Cloud SQL
-        start_cloud_sql(project, CLOUD_SQL_INSTANCE)
+        # wait_until_sql_ready(project, CLOUD_SQL_INSTANCE)
 
-        # Tunggu hingga Cloud SQL siap
-        wait_until_sql_ready(project, CLOUD_SQL_INSTANCE)
+        check_and_delete_existing_db(file_name, CLOUD_SQL_INSTANCE, project)
 
-        # Step 3: Upload file yang diekstrak ke Cloud SQL
-        for extracted_file in extracted_files:
-            upload_to_cloud_sql(extracted_file)
-    else:
-        logging.info(f"File {file_name} bukan GZIP, langsung upload ke Cloud SQL")
+        restore_backup(bucket_name, file_name, CLOUD_SQL_INSTANCE, project)
 
-        # Step 2: Menyalakan Cloud SQL
-        start_cloud_sql(project, CLOUD_SQL_INSTANCE)
+        # stop_cloud_sql(CLOUD_SQL_INSTANCE, project)
 
-        # Tunggu hingga Cloud SQL siap
-        wait_until_sql_ready(project, CLOUD_SQL_INSTANCE)
-
-        # Step 3: Upload file langsung ke Cloud SQL
-        upload_to_cloud_sql(file_name)
-
-    # Step 4: Mematikan Cloud SQL
-    stop_cloud_sql(project, CLOUD_SQL_INSTANCE)
+    except Exception as e:
+        logging.error(f"=========== Terjadi kesalahan di main function: {str(e)}")
+        # Optional: cleanup atau kirim notifikasi jika error terjadi
